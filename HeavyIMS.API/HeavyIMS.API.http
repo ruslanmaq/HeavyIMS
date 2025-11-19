@@ -1,0 +1,6 @@
+@HeavyIMS.API_HostAddress = http://localhost:5132
+
+GET {{HeavyIMS.API_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

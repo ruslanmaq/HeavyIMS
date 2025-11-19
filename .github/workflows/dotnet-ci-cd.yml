@@ -1,0 +1,296 @@
+name: .NET CI/CD Pipeline
+
+# DEMONSTRATES: Continuous Integration/Continuous Deployment
+#
+# TRIGGERS:
+# - Push to main/develop branches
+# - Pull requests
+# - Manual trigger (workflow_dispatch)
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  # Configuration
+  DOTNET_VERSION: '6.0.x'
+  AZURE_WEBAPP_NAME: 'heavyims-api'
+  AZURE_WEBAPP_PACKAGE_PATH: './publish'
+  BUILD_CONFIGURATION: 'Release'
+
+jobs:
+  # =================================================================
+  # JOB 1: BUILD AND TEST
+  # =================================================================
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+
+    steps:
+    # STEP 1: Checkout source code
+    - name: Checkout code
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0  # Full history for better analysis
+
+    # STEP 2: Setup .NET SDK
+    # DEMONSTRATES: Specifying runtime environment
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    # STEP 3: Restore dependencies
+    # DEMONSTRATES: NuGet package management
+    - name: Restore dependencies
+      run: dotnet restore HeavyIMS.sln
+      working-directory: ./
+
+    # STEP 4: Build solution
+    # DEMONSTRATES: Build configuration management
+    - name: Build solution
+      run: dotnet build HeavyIMS.sln --configuration ${{ env.BUILD_CONFIGURATION }} --no-restore
+      working-directory: ./
+
+    # STEP 5: Run unit tests
+    # DEMONSTRATES: Automated testing in pipeline
+    - name: Run unit tests
+      run: dotnet test HeavyIMS.Tests/HeavyIMS.Tests.csproj --configuration ${{ env.BUILD_CONFIGURATION }} --no-build --verbosity normal --logger "trx;LogFileName=test-results.trx"
+      working-directory: ./
+
+    # STEP 6: Run integration tests
+    - name: Run integration tests
+      run: dotnet test HeavyIMS.Tests/HeavyIMS.Tests.csproj --configuration ${{ env.BUILD_CONFIGURATION }} --no-build --filter "Category=Integration"
+      working-directory: ./
+
+    # STEP 7: Generate code coverage
+    # DEMONSTRATES: Code quality metrics
+    - name: Generate code coverage
+      run: dotnet test HeavyIMS.Tests/HeavyIMS.Tests.csproj --configuration ${{ env.BUILD_CONFIGURATION }} --no-build --collect:"XPlat Code Coverage"
+      working-directory: ./
+
+    # STEP 8: Upload test results
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-results
+        path: '**/test-results.trx'
+
+    # STEP 9: Upload code coverage
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: '**/coverage.cobertura.xml'
+        fail_ci_if_error: false
+
+  # =================================================================
+  # JOB 2: CODE QUALITY ANALYSIS
+  # =================================================================
+  code-quality:
+    name: Code Quality Analysis
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    # Static code analysis
+    - name: Run code analysis
+      run: dotnet build HeavyIMS.sln --configuration ${{ env.BUILD_CONFIGURATION }} /p:TreatWarningsAsErrors=true
+
+    # Security scanning (optional)
+    # - name: Run security scan
+    #   run: dotnet tool install --global security-scan && security-scan HeavyIMS.sln
+
+  # =================================================================
+  # JOB 3: BUILD DOCKER IMAGE (Optional)
+  # =================================================================
+  build-docker:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Login to Azure Container Registry
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ secrets.ACR_LOGIN_SERVER }}
+        username: ${{ secrets.ACR_USERNAME }}
+        password: ${{ secrets.ACR_PASSWORD }}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v4
+      with:
+        context: ./HeavyIMS.API
+        push: true
+        tags: ${{ secrets.ACR_LOGIN_SERVER }}/heavyims-api:${{ github.sha }},${{ secrets.ACR_LOGIN_SERVER }}/heavyims-api:latest
+
+  # =================================================================
+  # JOB 4: DEPLOY TO AZURE (Staging)
+  # =================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build-and-test, code-quality]
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: 'Staging'
+      url: ${{ steps.deploy.outputs.webapp-url }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Restore and publish
+      run: |
+        dotnet restore HeavyIMS.sln
+        dotnet publish HeavyIMS.API/HeavyIMS.API.csproj --configuration ${{ env.BUILD_CONFIGURATION }} --output ${{ env.AZURE_WEBAPP_PACKAGE_PATH }} --no-restore
+
+    - name: Deploy to Azure Web App (Staging)
+      id: deploy
+      uses: azure/webapps-deploy@v2
+      with:
+        app-name: ${{ env.AZURE_WEBAPP_NAME }}-staging
+        publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE_STAGING }}
+        package: ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
+
+    # Run smoke tests against staging
+    - name: Run smoke tests
+      run: |
+        sleep 30  # Wait for app to start
+        curl -f https://${{ env.AZURE_WEBAPP_NAME }}-staging.azurewebsites.net/health || exit 1
+
+  # =================================================================
+  # JOB 5: DEPLOY TO AZURE (Production)
+  # =================================================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-and-test, code-quality]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: 'Production'
+      url: ${{ steps.deploy.outputs.webapp-url }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Restore and publish
+      run: |
+        dotnet restore HeavyIMS.sln
+        dotnet publish HeavyIMS.API/HeavyIMS.API.csproj --configuration ${{ env.BUILD_CONFIGURATION }} --output ${{ env.AZURE_WEBAPP_PACKAGE_PATH }} --no-restore
+
+    - name: Deploy to Azure Web App (Production)
+      id: deploy
+      uses: azure/webapps-deploy@v2
+      with:
+        app-name: ${{ env.AZURE_WEBAPP_NAME }}
+        publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+        package: ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
+
+    # Run smoke tests against production
+    - name: Run smoke tests
+      run: |
+        sleep 30
+        curl -f https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/health || exit 1
+
+    # Notify team of deployment
+    - name: Notify deployment success
+      if: success()
+      run: echo "Production deployment successful!"
+      # In real scenario, send to Slack, Teams, etc.
+
+  # =================================================================
+  # JOB 6: DATABASE MIGRATION (Production)
+  # =================================================================
+  migrate-database:
+    name: Run Database Migrations
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Install EF Core tools
+      run: dotnet tool install --global dotnet-ef
+
+    - name: Run migrations
+      run: dotnet ef database update --project HeavyIMS.Infrastructure --startup-project HeavyIMS.API --connection "${{ secrets.AZURE_SQL_CONNECTION_STRING }}"
+      env:
+        ASPNETCORE_ENVIRONMENT: Production
+
+# =================================================================
+# SECRETS REQUIRED (Configure in GitHub Settings):
+# =================================================================
+# - AZURE_WEBAPP_PUBLISH_PROFILE: Azure Web App publish profile (Production)
+# - AZURE_WEBAPP_PUBLISH_PROFILE_STAGING: Azure Web App publish profile (Staging)
+# - AZURE_SQL_CONNECTION_STRING: Azure SQL Database connection string
+# - ACR_LOGIN_SERVER: Azure Container Registry server (if using Docker)
+# - ACR_USERNAME: ACR username
+# - ACR_PASSWORD: ACR password
+
+# =================================================================
+# CI/CD DESIGN NOTES:
+# =================================================================
+# 1. WHY CI/CD?
+#    - Automated testing catches bugs early
+#    - Consistent, repeatable deployments
+#    - Faster time to market
+#    - Reduced human error
+#
+# 2. PIPELINE STAGES:
+#    - Build: Compile code, restore dependencies
+#    - Test: Run automated tests
+#    - Quality: Static analysis, security scans
+#    - Deploy: Push to environment
+#    - Migrate: Update database schema
+#
+# 3. ENVIRONMENTS:
+#    - Development: Local development
+#    - Staging: Pre-production testing
+#    - Production: Live customer-facing
+#
+# 4. DEPLOYMENT STRATEGIES:
+#    - Blue-Green: Two identical environments, switch traffic
+#    - Canary: Gradual rollout to subset of users
+#    - Rolling: Update instances one at a time
+#
+# 5. ROLLBACK STRATEGY:
+#    - Keep previous version artifacts
+#    - Database migrations backward compatible
+#    - Feature flags for quick disable
